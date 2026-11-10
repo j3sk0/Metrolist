@@ -51,7 +51,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp "$(find app/build/outputs/apk -name '*universal*.apk' | head -1)" KI-DJ.apk
+          find app/build/outputs/apk -name '*.apk'
+          cp "$(find app/build/outputs/apk -name '*.apk' | head -1)" KI-DJ.apk
           gh release view ki-dj-latest >/dev/null 2>&1 || gh release create ki-dj-latest --target "$GITHUB_SHA" \
             --title "KI-DJ (neuester Build)" --notes "Auf dem Handy KI-DJ.apk antippen und installieren."
           gh release upload ki-dj-latest KI-DJ.apk --clobber
