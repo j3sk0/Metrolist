@@ -7,7 +7,7 @@ on:
     branches: ["ki-dj", "main"]
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -46,3 +46,12 @@ jobs:
         with:
           name: ki-dj-apk
           path: app/build/outputs/apk/**/*.apk
+      - name: Publish APK as direct download
+        # Fixed link: https://github.com/<owner>/<repo>/releases/download/ki-dj-latest/KI-DJ.apk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "$(find app/build/outputs/apk -name '*universal*.apk' | head -1)" KI-DJ.apk
+          gh release view ki-dj-latest >/dev/null 2>&1 || gh release create ki-dj-latest --target "$GITHUB_SHA" \
+            --title "KI-DJ (neuester Build)" --notes "Auf dem Handy KI-DJ.apk antippen und installieren."
+          gh release upload ki-dj-latest KI-DJ.apk --clobber
