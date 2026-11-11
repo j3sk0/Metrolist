@@ -320,6 +320,8 @@ dependencies {
     implementation(libs.camera.lifecycle)
     implementation(libs.camera.view)
     implementation(libs.zxing.core)
+    // On-device text recognition for guest screenshots (model bundled, no network)
+    implementation(libs.mlkit.text)
 
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)

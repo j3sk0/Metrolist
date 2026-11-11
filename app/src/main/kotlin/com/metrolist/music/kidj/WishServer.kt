@@ -22,10 +22,23 @@ class WishServer(
     private val handler: Handler,
 ) {
     interface Handler {
-        /** Returns a short message for the guest. */
+        /** Free text or a link. Returns a short message for the guest. */
         fun wish(query: String, guest: String): String
-        fun vote(id: String, guest: String): Boolean
-        fun wishesJson(): String
+
+        /** A song picked from suggestions. */
+        fun wishId(id: String, guest: String): String
+
+        /** Like ([value] 1) or dislike (-1). False if the guest already rated it that way. */
+        fun vote(id: String, value: Int, guest: String): Boolean
+
+        /** Now playing, upcoming queue and open wishes as JSON, with this guest's own ratings. */
+        fun stateJson(guest: String): String
+
+        /** Suggestions while typing as JSON. */
+        fun suggestJson(query: String): String
+
+        /** Songs recognized on an uploaded screenshot as JSON (same shape as suggestions). */
+        fun screenshotJson(image: ByteArray): String
     }
 
     private var socket: ServerSocket? = null
@@ -74,27 +87,41 @@ class WishServer(
 
     internal fun route(req: Request, guest: String): Response = when {
         req.method == "GET" && req.path == "/" -> Response(200, "text/html", WISH_PAGE)
-        req.method == "GET" && req.path == "/api/wishes" -> Response(200, "application/json", handler.wishesJson())
-        req.method == "POST" && req.path == "/api/wish" -> {
+        req.method == "GET" && req.path == "/api/state" -> Response(200, "application/json", handler.stateJson(guest))
+        req.method == "GET" && req.path == "/api/suggest" -> {
             val q = req.form["q"]?.trim().orEmpty().take(MAX_QUERY)
-            if (q.length < 2) Response(400, "application/json", jsonMessage("Bitte Titel und Interpret eingeben."))
-            else Response(200, "application/json", jsonMessage(handler.wish(q, guest)))
+            Response(200, "application/json", if (q.length < 2) "{\"items\":[]}" else handler.suggestJson(q))
+        }
+        req.method == "POST" && req.path == "/api/wish" -> {
+            val id = req.form["id"].orEmpty().take(32)
+            val q = req.form["q"]?.trim().orEmpty().take(MAX_QUERY)
+            when {
+                id.isNotEmpty() -> Response(200, "application/json", jsonMessage(handler.wishId(id, guest)))
+                q.length < 2 -> Response(400, "application/json", jsonMessage("Bitte Titel, Interpret oder Link eingeben."))
+                else -> Response(200, "application/json", jsonMessage(handler.wish(q, guest)))
+            }
         }
         req.method == "POST" && req.path == "/api/vote" -> {
-            val ok = handler.vote(req.form["id"].orEmpty().take(32), guest)
-            Response(200, "application/json", jsonMessage(if (ok) "Stimme gezählt" else "Schon abgestimmt"))
+            val value = if (req.form["v"] == "-1") -1 else 1
+            val ok = handler.vote(req.form["id"].orEmpty().take(32), value, guest)
+            Response(200, "application/json", jsonMessage(if (!ok) "Schon so bewertet" else if (value > 0) "Gefällt dir" else "Abgewählt"))
         }
+        req.method == "POST" && req.path == SCREENSHOT_PATH ->
+            if (req.body.isEmpty()) Response(400, "application/json", "{\"items\":[]}")
+            else Response(200, "application/json", handler.screenshotJson(req.body))
         else -> Response(404, "text/plain", "not found")
     }
 
-    internal data class Request(val method: String, val path: String, val form: Map<String, String>)
+    internal class Request(val method: String, val path: String, val form: Map<String, String>, val body: ByteArray = ByteArray(0))
 
     internal data class Response(val status: Int, val type: String, val body: String)
 
     companion object {
         const val DEFAULT_PORT = 8080
         private const val MAX_BODY = 2048
-        private const val MAX_QUERY = 120
+        private const val MAX_IMAGE = 2_000_000
+        private const val MAX_QUERY = 300
+        private const val SCREENSHOT_PATH = "/api/screenshot"
 
         internal fun readRequest(input: InputStream): Request? {
             val lines = mutableListOf<String>()
@@ -118,7 +145,9 @@ class WishServer(
             val length = lines.drop(1)
                 .firstOrNull { it.startsWith("content-length:", ignoreCase = true) }
                 ?.substringAfter(':')?.trim()?.toIntOrNull() ?: 0
-            if (length > MAX_BODY) return null
+            val path = parts[1].substringBefore('?')
+            val isImage = path == SCREENSHOT_PATH
+            if (length > (if (isImage) MAX_IMAGE else MAX_BODY)) return null
             val body = ByteArray(length)
             var read = 0
             while (read < length) {
@@ -126,13 +155,17 @@ class WishServer(
                 if (n < 0) break
                 read += n
             }
-            return Request(parts[0], parts[1].substringBefore('?'), parseForm(String(body, 0, read)))
+            val query = parseForm(parts[1].substringAfter('?', ""))
+            return if (isImage) Request(parts[0], path, query, body.copyOf(read))
+            else Request(parts[0], path, query + parseForm(String(body, 0, read)))
         }
 
         internal fun parseForm(body: String): Map<String, String> =
-            body.split('&').filter { '=' in it }.associate {
-                URLDecoder.decode(it.substringBefore('='), "UTF-8") to URLDecoder.decode(it.substringAfter('='), "UTF-8")
-            }
+            body.split('&').filter { '=' in it }.mapNotNull {
+                runCatching {
+                    URLDecoder.decode(it.substringBefore('='), "UTF-8") to URLDecoder.decode(it.substringAfter('='), "UTF-8")
+                }.getOrNull()
+            }.toMap()
 
         fun jsonString(s: String?): String {
             if (s == null) return "null"
@@ -150,35 +183,6 @@ class WishServer(
 
         private fun jsonMessage(msg: String) = "{\"message\":${jsonString(msg)}}"
 
-        private val WISH_PAGE = """
-<!doctype html><html lang="de"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Musikwunsch</title>
-<style>
-:root{color-scheme:dark}body{margin:0;font:16px system-ui,sans-serif;background:#111;color:#eee}
-main{max-width:520px;margin:auto;padding:16px}h1{font-size:22px}
-form{display:flex;gap:8px}input{flex:1;padding:12px;border-radius:10px;border:1px solid #444;background:#222;color:#eee;font-size:16px}
-button{padding:12px 16px;border:0;border-radius:10px;background:#7c4dff;color:#fff;font-size:16px}
-#msg{min-height:24px;margin:10px 0;color:#b9a6ff}
-li{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #222}
-li img{width:48px;height:48px;border-radius:6px;object-fit:cover}li div{flex:1;min-width:0}
-li small{color:#999;display:block}ul{list-style:none;padding:0}
-</style></head><body><main>
-<h1>Wünsch dir einen Song</h1>
-<form id="f"><input id="q" maxlength="120" placeholder="Titel und Interpret" autocomplete="off" required><button>Senden</button></form>
-<div id="msg" role="status"></div>
-<h2>Wünsche</h2><ul id="list"></ul>
-</main><script>
-const ${'$'}=s=>document.querySelector(s);
-async function post(url,data){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(data)});return (await r.json()).message}
-async function load(){const w=await (await fetch('/api/wishes')).json();const ul=${'$'}('#list');ul.replaceChildren();
-for(const x of w){const li=document.createElement('li');const img=document.createElement('img');img.src=x.thumbnail||'';img.alt='';
-const d=document.createElement('div');d.textContent=x.title;const s=document.createElement('small');s.textContent=x.artist+' · '+x.votes+' Stimme(n)';d.append(s);
-const b=document.createElement('button');b.textContent='+1';b.onclick=async()=>{${'$'}('#msg').textContent=await post('/api/vote',{id:x.id});load()};
-li.append(img,d,b);ul.append(li)}}
-${'$'}('#f').onsubmit=async e=>{e.preventDefault();${'$'}('#msg').textContent='Suche…';${'$'}('#msg').textContent=await post('/api/wish',{q:${'$'}('#q').value});${'$'}('#q').value='';load()};
-load();setInterval(load,10000);
-</script></body></html>
-"""
+        private const val WISH_PAGE = WISH_PAGE_HTML
     }
 }

@@ -13,10 +13,11 @@ data class Wish(
     val title: String,
     val artist: String,
     val thumbnail: String?,
+    /** Guests who asked for the song; their wish also counts as a like. */
     val guests: MutableSet<String> = linkedSetOf(),
-) {
-    val votes get() = guests.size
-}
+    /** Likes minus dislikes of all guests. */
+    val votes: Int = 0,
+)
 
 enum class WishResult { ADDED, VOTED, ALREADY_VOTED, LIMIT_REACHED }
 
@@ -27,16 +28,31 @@ class DjBrain(
     private val wishes = LinkedHashMap<String, Wish>()
     private val reaction = HashMap<String, Double>()
 
+    /** Like (+1) or dislike (-1) per guest and song, for wishes and queue items alike. */
+    private val ratings = HashMap<String, HashMap<String, Int>>()
+
     @Synchronized
     fun addWish(id: String, title: String, artist: String, thumbnail: String?, guest: String): WishResult {
-        wishes[id]?.let { return if (it.guests.add(guest)) WishResult.VOTED else WishResult.ALREADY_VOTED }
+        wishes[id]?.let {
+            it.guests.add(guest)
+            return if (rate(id, guest, 1)) WishResult.VOTED else WishResult.ALREADY_VOTED
+        }
         if (wishes.values.count { guest in it.guests } >= maxOpenPerGuest) return WishResult.LIMIT_REACHED
         wishes[id] = Wish(id, title, artist, thumbnail, linkedSetOf(guest))
+        rate(id, guest, 1)
         return WishResult.ADDED
     }
 
+    /** Returns false if the guest had already given exactly this rating. */
     @Synchronized
-    fun vote(id: String, guest: String): Boolean = wishes[id]?.guests?.add(guest) ?: false
+    fun rate(id: String, guest: String, value: Int): Boolean =
+        ratings.getOrPut(id) { HashMap() }.put(guest, if (value < 0) -1 else 1) != (if (value < 0) -1 else 1)
+
+    @Synchronized
+    fun scoreOf(id: String): Int = ratings[id]?.values?.sum() ?: 0
+
+    @Synchronized
+    fun ratingOf(id: String, guest: String): Int = ratings[id]?.get(guest) ?: 0
 
     @Synchronized
     fun remove(id: String) {
@@ -45,12 +61,13 @@ class DjBrain(
 
     @Synchronized
     fun wishes(floor: Double, currentArtist: String?): List<Wish> =
-        wishes.values.sortedByDescending { score(it, floor, currentArtist) }.map { it.copy(guests = it.guests.toMutableSet()) }
+        wishes.values.map { it.copy(guests = it.guests.toMutableSet(), votes = scoreOf(it.id)) }
+            .sortedByDescending { score(it, floor, currentArtist) }
 
     /** Takes the wish that fits best right now out of the list. */
     @Synchronized
     fun pickNext(floor: Double, currentArtist: String?): Wish? =
-        wishes.values.maxByOrNull { score(it, floor, currentArtist) }?.also { wishes.remove(it.id) }
+        wishes(floor, currentArtist).firstOrNull()?.also { wishes.remove(it.id) }
 
     fun score(w: Wish, floor: Double, currentArtist: String?): Double {
         val learned = reaction[w.artist.lowercase()] ?: 0.5
@@ -122,3 +139,41 @@ fun motionEnergy(prev: ByteArray, cur: ByteArray, sensitivity: Double, step: Int
     }
     return min(1.0, sum.toDouble() / count / 255.0 * sensitivity)
 }
+
+private val YOUTUBE_ID = Regex("""(?:youtube\.com/(?:watch\?(?:[^\s#]*&)?v=|shorts/|live/|embed/)|youtu\.be/)([\w-]{11})""")
+
+/** Video id if [text] contains a YouTube or YouTube Music link. */
+fun youtubeId(text: String): String? = YOUTUBE_ID.find(text)?.groupValues?.get(1)
+
+/** Music sites whose page title names the song; only these are ever fetched for a guest. */
+val LINK_HOSTS = setOf("open.spotify.com", "music.apple.com", "www.deezer.com", "deezer.com", "soundcloud.com", "tidal.com", "listen.tidal.com")
+
+private val TITLE_NOISE = Regex(
+    """\|.*$|song and lyrics by|song und lyrics von|\bsong by\b|\bsong von\b|\bon apple music\b|\bbei apple music\b|apple music|spotify|deezer|soundcloud|tidal|stream .* (?:by|von) |listen (?:online )?for free.*$|- single\b|- ep\b""",
+    RegexOption.IGNORE_CASE,
+)
+
+/** Turns a streaming page title like "Song - song and lyrics by Artist | Spotify" into a search query. */
+fun cleanPageTitle(title: String): String =
+    title.replace("&amp;", "&").replace("&#39;", "'").replace("&quot;", "\"")
+        .replace(TITLE_NOISE, " ")
+        .replace(Regex("""[‎‏–—\-|·•]+"""), " ")
+        .replace(Regex("""\s+"""), " ").trim()
+
+/**
+ * Search query from OCR lines (text to pixel height): the two tallest plausible lines,
+ * which on player screenshots are the song title and the artist.
+ */
+fun ocrQuery(lines: List<Pair<String, Int>>): String =
+    lines.asSequence()
+        .map { it.first.trim() to it.second }
+        .filter { (t, _) -> t.count(Char::isLetter) >= 2 && t.length <= 60 && !t.matches(Regex("""[\d:.\s%-]+""")) }
+        .sortedByDescending { it.second }
+        .take(2)
+        .joinToString(" ") { it.first }
+
+/**
+ * Play order of the upcoming queue by guest rating: indices sorted by score, highest first.
+ * Stable, so songs nobody rated keep their order between liked and disliked ones.
+ */
+fun voteOrder(scores: List<Int>): List<Int> = scores.indices.sortedByDescending { scores[it] }
